@@ -1,0 +1,218 @@
+import smbus
+import time
+import RPi.GPIO as GPIO
+import Adafruit_GPIO.MCP230xx as MCP230XX
+
+# Initialize SMBus for I2C communication with ADS1110
+bus = smbus.SMBus(1)
+address = 0x48  # I2C address of ADS1110
+mcp = MCP230XX.MCP23008(address=0x20, busnum=1)  # Initialize MCP23008,Update the address if necessary
+
+# GPIO setup
+GPIO.setmode(GPIO.BCM)
+GPIO.setwarnings(False)
+
+# Define GPIO pins and MCP23008 pins
+PIR_OUTSIDE = 17  # PIR sensor outside the room
+PIR_INSIDE = 27   # PIR sensor inside the room
+LED_PIN = 22      # Single LED to indicate presence
+LDR_PIN = 4       # LDR sensor to detect ambient light
+RELAY_PIN = 18    # Relay connected to the motor 
+MCP_ROWS = [0, 1, 2, 3]  # GPA0, GPA1, GPA2, GPA3
+MCP_COLS = [4, 5, 6]     # GPA4, GPA5, GPA6
+MCP_RELAY_PIN = 7        # GPA7
+
+# Keypad layout
+KEYPAD = [
+    ["1", "2", "3"],
+    ["4", "5", "6"],
+    ["7", "8", "9"],
+    ["*", "0", "#"]
+]
+
+# Predefined password
+PASSWORD = "1234"
+
+# Define some LCD constants
+LCD_RS = 5
+LCD_E  = 6
+LCD_D4 = 12
+LCD_D5 = 13
+LCD_D6 = 16
+LCD_D7 = 19
+
+# Define LCD constants
+LCD_WIDTH = 16    # Maximum characters per line
+LCD_CHR = True
+LCD_CMD = False
+LCD_LINE_1 = 0x80 # LCD RAM address for the 1st line
+LCD_LINE_2 = 0xC0 # LCD RAM address for the 2nd line
+E_PULSE = 0.0005
+E_DELAY = 0.0005
+
+# Initialize GPIO pins
+GPIO.setup(PIR_OUTSIDE, GPIO.IN)
+GPIO.setup(PIR_INSIDE, GPIO.IN)
+GPIO.setup(LED_PIN, GPIO.OUT)
+GPIO.setup(LDR_PIN, GPIO.IN)
+
+# Initialize MCP23008 for keypad 
+for row in MCP_ROWS:
+    mcp.setup(row, MCP230XX.GPIO.OUT)
+    mcp.output(row, MCP230XX.GPIO.LOW)
+for col in MCP_COLS:
+    mcp.setup(col, MCP230XX.GPIO.IN)
+
+mcp.setup(MCP_RELAY_PIN, MCP230XX.GPIO.OUT)
+mcp.output(MCP_RELAY_PIN, MCP230XX.GPIO.LOW)  # Ensure relay is off initially
+GPIO.setup(RELAY_PIN, GPIO.OUT)
+GPIO.output(RELAY_PIN, GPIO.LOW)  # Ensure relay is off initially
+
+# Initialize GPIO for LCD
+GPIO.setup(LCD_E, GPIO.OUT)  # E
+GPIO.setup(LCD_RS, GPIO.OUT) # RS
+GPIO.setup(LCD_D4, GPIO.OUT) # DB4
+GPIO.setup(LCD_D5, GPIO.OUT) # DB5
+GPIO.setup(LCD_D6, GPIO.OUT) # DB6
+GPIO.setup(LCD_D7, GPIO.OUT) # DB7
+
+def lcd_init():
+    lcd_byte(0x33, LCD_CMD)
+    lcd_byte(0x32, LCD_CMD)
+    lcd_byte(0x06, LCD_CMD)
+    lcd_byte(0x0C, LCD_CMD)
+    lcd_byte(0x28, LCD_CMD)
+    lcd_byte(0x01, LCD_CMD)
+    time.sleep(E_DELAY)
+
+def lcd_byte(bits, mode):
+    GPIO.output(LCD_RS, mode)  # RS
+    GPIO.output(LCD_D4, bits & 0x10)
+    GPIO.output(LCD_D5, bits & 0x20)
+    GPIO.output(LCD_D6, bits & 0x40)
+    GPIO.output(LCD_D7, bits & 0x80)
+    # Toggle 'Enable' pin
+    lcd_toggle_enable()
+    GPIO.output(LCD_D4, bits & 0x01)
+    GPIO.output(LCD_D5, bits & 0x02)
+    GPIO.output(LCD_D6, bits & 0x04)
+    GPIO.output(LCD_D7, bits & 0x08)
+    # Toggle 'Enable' pin
+    lcd_toggle_enable()
+
+def lcd_toggle_enable():
+    time.sleep(E_DELAY)
+    GPIO.output(LCD_E, True)
+    time.sleep(E_PULSE)
+    GPIO.output(LCD_E, False)
+    time.sleep(E_DELAY)
+
+def lcd_string(message, line):
+    message = message.ljust(LCD_WIDTH, " ")
+    lcd_byte(line, LCD_CMD)
+    for i in range(LCD_WIDTH):
+        lcd_byte(ord(message[i]), LCD_CHR)
+
+def scan_keypad():
+    for row_idx, row in enumerate(MCP_ROWS):
+        mcp.output(row, MCP230XX.GPIO.HIGH)
+        time.sleep(0.02)
+        for col_idx, col in enumerate(MCP_COLS):
+            if mcp.input(col) == MCP230XX.GPIO.HIGH:
+                mcp.output(row, MCP230XX.GPIO.LOW)
+                return KEYPAD[row_idx][col_idx]
+        mcp.output(row, MCP230XX.GPIO.LOW)
+        time.sleep(0.02)
+    return None
+
+def get_password():
+    entered_password = ""
+    while len(entered_password) < 4:
+        digit = scan_keypad()
+        if digit:
+            print(f"Pressed: {digit}")
+            entered_password += digit
+            time.sleep(0.3)  # Debounce delay
+    return entered_password
+
+def control_led(people_count):
+    if people_count > 0 and GPIO.input(LDR_PIN) == GPIO.LOW:
+        GPIO.output(LED_PIN, GPIO.HIGH)
+    else:
+        GPIO.output(LED_PIN, GPIO.LOW)
+
+def read_temperature():
+    raw_data = bus.read_word_data(address, 0)
+    temperature = ((raw_data & 0xFF) << 8) | (raw_data >> 8)
+    temperature = temperature / 10  # Convert to temperature in °C
+    return temperature
+
+def control_motor(temperature, people_count):
+    if temperature >= 25 and people_count > 0:
+        GPIO.output(RELAY_PIN, GPIO.HIGH)
+        print("Motor ON")
+    else:
+        GPIO.output(RELAY_PIN, GPIO.LOW)
+        print("Motor OFF")
+
+def main():
+    global people_count
+    people_count = 0  # Initialize people_count
+    # Initialize the LCD
+    lcd_init()
+    while True:
+        # Handle keypad access
+        temperature = read_temperature()
+        print(f"Temperature: {temperature:.2f}C")
+        # Check if the outside PIR sensor is activated (Entering)
+        if GPIO.input(PIR_OUTSIDE):
+            print("PIR Outside ENT")
+            print("Enter 4-digit password or press **** to skip:")
+            entered_password = get_password()
+            if entered_password == PASSWORD:
+                print("Password correct!")
+                mcp.output(MCP_RELAY_PIN, MCP230XX.GPIO.HIGH)  # Turn on MCP23008 relay
+                time.sleep(5)  # Keep relay on for 5 seconds
+                mcp.output(MCP_RELAY_PIN, MCP230XX.GPIO.LOW)
+            elif entered_password == "****":
+                print("Skipping password check")
+            else:
+                print("Incorrect password. Try again.")
+            while not GPIO.input(PIR_INSIDE):
+                time.sleep(0.1)
+            print("PIR Inside ENTRD")
+            people_count += 1
+            print("Person entered")
+            print(f"People count: {people_count}")
+            lcd_string("People count:", LCD_LINE_1)
+            lcd_string(f"{people_count}", LCD_LINE_2)
+            while GPIO.input(PIR_INSIDE):
+                time.sleep(0.1)
+
+        # Check if the inside PIR sensor is activated (Exiting)
+        elif GPIO.input(PIR_INSIDE):
+            print("PIR Inside activated exit")
+            time.sleep(0.01)
+            while not GPIO.input(PIR_OUTSIDE):
+                time.sleep(0.1)
+            print("PIR Outside EXTD")
+            if people_count > 0:
+                people_count -= 1
+            print("Person exited")
+            print(f"People count: {people_count}")
+            lcd_string("People count:", LCD_LINE_1)
+            lcd_string(f"{people_count}", LCD_LINE_2)
+            while GPIO.input(PIR_OUTSIDE):
+                time.sleep(0.1)
+        control_led(people_count) # Control the LED based on the updated people count and LDR status
+        control_motor(temperature, people_count)  # Control the motor based on temperature and people count
+        time.sleep(1)
+
+if __name__ == '__main__':
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        lcd_byte(0x01, LCD_CMD) 
+        GPIO.cleanup()
